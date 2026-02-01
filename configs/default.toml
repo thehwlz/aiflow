@@ -1,0 +1,37 @@
+# aiflow default configuration
+# Copy this file to ~/.aiflow/config.toml to customize
+
+# Directory for worktrees (relative to repo root)
+worktree_dir = ".aiflow-worktrees"
+
+# Maximum number of parallel task executions
+max_parallel = 3
+
+# Path to Claude Code binary (empty = use PATH)
+claude_code_path = ""
+
+# Default base branch for worktrees
+default_branch = "main"
+
+# Maximum number of files to include in context
+context_max_files = 20
+
+# Maximum tokens for context (approximate)
+context_max_tokens = 8000
+
+# State directory for run persistence
+state_dir = "~/.aiflow/state"
+
+# File lock timeout duration
+lock_timeout = "5m"
+
+# Summary inclusion settings for hybrid context management
+[summaries]
+# Include full summaries for tasks that depend on completed tasks
+include_for_dependencies = true
+
+# Include light summaries for tasks in the same feature (but no direct dependency)
+include_for_same_feature = true
+
+# Maximum tokens per summary inclusion
+max_summary_tokens = 1000

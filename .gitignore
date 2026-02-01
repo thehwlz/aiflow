@@ -1,0 +1,36 @@
+# Binaries (root level only)
+/aiflow
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# aiflow runtime
+.aiflow-worktrees/
+.aiflow-locks/
+.aiflow-prompt-*.md
+
+# Local config (users should create their own)
+# Keep configs/default.toml as template

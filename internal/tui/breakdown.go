@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/howell-aikit/aiflow/internal/breakdown"
@@ -15,6 +18,21 @@ import (
 	"github.com/howell-aikit/aiflow/internal/config"
 	"github.com/howell-aikit/aiflow/internal/state"
 )
+
+var debugLog *log.Logger
+
+func init() {
+	f, err := os.OpenFile("/tmp/aiflow-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		debugLog = log.New(f, "", log.LstdFlags)
+	}
+}
+
+func logDebug(format string, args ...interface{}) {
+	if debugLog != nil {
+		debugLog.Printf(format, args...)
+	}
+}
 
 // BreakdownPhase represents the current phase of breakdown
 type BreakdownPhase int
@@ -46,6 +64,7 @@ type BreakdownModel struct {
 	claudeOutput    []string       // Text output from Claude (for display)
 	currentQuestion *questionState // Current question being displayed
 	cancelPlanning  context.CancelFunc
+	msgChan         chan tea.Msg // Channel for receiving messages from planning goroutine
 
 	// Task review (PhaseReview)
 	tasks        []*state.Task
@@ -63,7 +82,7 @@ type questionState struct {
 	answers         map[string]string // Collected answers
 	selectedOption  int               // Currently selected option
 	isOtherSelected bool
-	otherInput      textinput.Model
+	otherInput      textarea.Model
 }
 
 // NewBreakdownModel creates a new breakdown model
@@ -136,10 +155,13 @@ func (m BreakdownModel) Update(msg tea.Msg) (BreakdownModel, tea.Cmd) {
 		return m, nil
 
 	case planningQuestionMsg:
+		logDebug("planningQuestionMsg: entering PhaseQuestion with %d questions", len(msg.questions))
 		m.phase = PhaseQuestion
-		otherInput := textinput.New()
-		otherInput.Placeholder = "Type your answer..."
-		otherInput.Width = 60
+		otherInput := textarea.New()
+		otherInput.Placeholder = "Type your answer (Enter for new line, Ctrl+D to submit)..."
+		otherInput.SetWidth(60)
+		otherInput.SetHeight(4)
+		otherInput.ShowLineNumbers = false
 		m.currentQuestion = &questionState{
 			toolUseID:  msg.toolUseID,
 			questions:  msg.questions,
@@ -159,11 +181,49 @@ func (m BreakdownModel) Update(msg tea.Msg) (BreakdownModel, tea.Cmd) {
 		return m, nil
 
 	case planningErrorMsg:
+		logDebug("planningErrorMsg: %v", msg.err)
 		m.err = msg.err
 		return m, nil
+
+	case pollChannelMsg:
+		// Poll for more messages from planning goroutine
+		if m.msgChan == nil {
+			logDebug("pollChannelMsg: msgChan is nil")
+			return m, nil
+		}
+		select {
+		case msg, ok := <-m.msgChan:
+			if !ok {
+				// Channel closed, planning complete
+				logDebug("pollChannelMsg: channel closed, phase=%d", m.phase)
+				m.msgChan = nil
+				return m, nil
+			}
+			logDebug("pollChannelMsg: received message type=%T", msg)
+			// Process the message and continue polling
+			newModel, cmd := m.Update(msg)
+			return newModel, tea.Batch(cmd, newModel.pollChannel())
+		default:
+			// No message available, schedule next poll with a small delay
+			return m, m.pollChannelDelayed()
+		}
 	}
 
 	return m, nil
+}
+
+// pollChannel returns a command that polls the message channel immediately
+func (m BreakdownModel) pollChannel() tea.Cmd {
+	return func() tea.Msg {
+		return pollChannelMsg{}
+	}
+}
+
+// pollChannelDelayed returns a command that polls after a small delay
+func (m BreakdownModel) pollChannelDelayed() tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return pollChannelMsg{}
+	})
 }
 
 func (m BreakdownModel) handleKeyMsg(msg tea.KeyMsg) (BreakdownModel, tea.Cmd) {
@@ -219,7 +279,7 @@ func (m BreakdownModel) handleQuestionInput(msg tea.KeyMsg) (BreakdownModel, tea
 	// If typing in "Other" input
 	if q.isOtherSelected {
 		switch msg.String() {
-		case "enter":
+		case "ctrl+d":
 			answer := strings.TrimSpace(q.otherInput.Value())
 			if answer == "" {
 				return m, nil
@@ -227,6 +287,7 @@ func (m BreakdownModel) handleQuestionInput(msg tea.KeyMsg) (BreakdownModel, tea
 			return m.submitQuestionAnswer(answer)
 		case "esc":
 			q.isOtherSelected = false
+			q.otherInput.Blur()
 			return m, nil
 		default:
 			var cmd tea.Cmd
@@ -250,7 +311,7 @@ func (m BreakdownModel) handleQuestionInput(msg tea.KeyMsg) (BreakdownModel, tea
 			q.isOtherSelected = true
 			q.otherInput.Reset()
 			q.otherInput.Focus()
-			return m, textinput.Blink
+			return m, textarea.Blink
 		}
 		return m.submitQuestionAnswer(currentQ.Options[q.selectedOption].Label)
 	case "esc":
@@ -279,6 +340,7 @@ func (m BreakdownModel) submitQuestionAnswer(answer string) (BreakdownModel, tea
 	q.selectedOption = 0
 	q.isOtherSelected = false
 	q.otherInput.Reset()
+	q.otherInput.Blur()
 
 	if q.currentIdx >= len(q.questions) {
 		// All questions answered, send tool result back to Claude
@@ -444,7 +506,7 @@ func (m BreakdownModel) viewQuestion() string {
 	if q.isOtherSelected {
 		b.WriteString("  " + q.otherInput.View())
 		b.WriteString("\n\n")
-		b.WriteString(dimStyle.Render("  Enter to submit • Esc to go back"))
+		b.WriteString(dimStyle.Render("  Ctrl+D to submit • Esc to go back"))
 	} else {
 		for i, opt := range currentQ.Options {
 			isSelected := i == q.selectedOption
@@ -601,115 +663,105 @@ type planningErrorMsg struct {
 	err error
 }
 
+type pollChannelMsg struct{}
+
 func (m BreakdownModel) showProjectType() tea.Cmd {
 	return func() tea.Msg {
 		return projectTypeMsg{projectType: m.run.ProjectType}
 	}
 }
 
-// planningState holds shared state for the planning goroutine
-type planningState struct {
-	mu          sync.Mutex
-	pendingMsgs []tea.Msg
-}
-
 func (m *BreakdownModel) startPlanning() tea.Cmd {
-	return func() tea.Msg {
-		// Create context with cancellation
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancelPlanning = cancel
+	// Create context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelPlanning = cancel
 
-		// Get config values
-		claudePath := ""
-		if m.cfg != nil {
-			claudePath = m.cfg.ClaudeCodePath
-		}
-		workDir := m.run.WorktreePath
-		if workDir == "" {
-			workDir = "."
-		}
+	// Get config values
+	claudePath := ""
+	if m.cfg != nil {
+		claudePath = m.cfg.ClaudeCodePath
+	}
+	workDir := m.run.WorktreePath
+	if workDir == "" {
+		workDir = "."
+	}
 
-		// Create streaming client
-		m.streamClient = claude.NewStreamingClient(claude.StreamingClientConfig{
-			ClaudePath: claudePath,
-			WorkDir:    workDir,
-		})
+	// Create streaming client
+	m.streamClient = claude.NewStreamingClient(claude.StreamingClientConfig{
+		ClaudePath: claudePath,
+		WorkDir:    workDir,
+	})
 
-		// Channel for receiving messages
-		msgChan := make(chan tea.Msg, 10)
-		var wg sync.WaitGroup
-		wg.Add(1)
+	// Channel for receiving messages
+	m.msgChan = make(chan tea.Msg, 100)
 
-		// Start streaming in goroutine
-		go func() {
-			defer wg.Done()
-			defer close(msgChan)
-
-			prompt := claude.BuildPlanningPrompt(m.run.FeatureDesc, m.projectType)
-
-			err := m.streamClient.Start(ctx, prompt, claude.StreamOptions{
-				SystemPrompt:    claude.PlanningSystemPrompt,
-				SkipPermissions: true,
-
-				OnText: func(text string) {
-					// Check for breakdown JSON in the text
-					if strings.Contains(text, `"type": "breakdown"`) || strings.Contains(text, `"type":"breakdown"`) {
-						tasks, err := parseBreakdownFromText(text)
-						if err == nil && len(tasks) > 0 {
-							msgChan <- planningCompleteMsg{tasks: tasks}
-							m.streamClient.Stop()
-							return
-						}
-					}
-					msgChan <- planningTextMsg{text: TruncateString(strings.TrimSpace(text), 100)}
-				},
-
-				OnToolUse: func(toolUse *claude.ToolUse) (*claude.ToolResult, error) {
-					if toolUse.IsAskUserQuestion() {
-						input, err := toolUse.ParseAskUserQuestionInput()
-						if err != nil {
-							return nil, err
-						}
-						// Send question to TUI and wait for answer
-						// The answer will be sent via SendToolResult
-						msgChan <- planningQuestionMsg{
-							toolUseID: toolUse.ID,
-							questions: input.Questions,
-						}
-						// Return nil to indicate we're handling this asynchronously
-						return nil, nil
-					}
-					// Let Claude handle other tools
-					return nil, nil
-				},
-
-				OnError: func(err error) {
-					msgChan <- planningErrorMsg{err: err}
-				},
-			})
-
-			if err != nil {
-				msgChan <- planningErrorMsg{err: err}
-				return
-			}
-
-			// Wait for completion
-			if err := m.streamClient.Wait(); err != nil {
-				// Don't report error if we intentionally stopped
-				if ctx.Err() == nil {
-					msgChan <- planningErrorMsg{err: err}
-				}
-			}
+	// Start streaming in goroutine
+	go func() {
+		logDebug("startPlanning: goroutine started")
+		defer func() {
+			logDebug("startPlanning: goroutine ending, closing channel")
+			close(m.msgChan)
 		}()
 
-		// Return the first message (or wait for one)
-		select {
-		case msg := <-msgChan:
-			return msg
-		case <-ctx.Done():
-			return planningErrorMsg{err: ctx.Err()}
+		prompt := claude.BuildPlanningPrompt(m.run.FeatureDesc, m.projectType)
+
+		err := m.streamClient.Start(ctx, prompt, claude.StreamOptions{
+			SystemPrompt:    claude.PlanningSystemPrompt,
+			SkipPermissions: true,
+
+			OnText: func(text string) {
+				// Check for breakdown JSON in the text
+				if strings.Contains(text, `"type": "breakdown"`) || strings.Contains(text, `"type":"breakdown"`) {
+					tasks, err := parseBreakdownFromText(text)
+					if err == nil && len(tasks) > 0 {
+						m.msgChan <- planningCompleteMsg{tasks: tasks}
+						m.streamClient.Stop()
+						return
+					}
+				}
+				m.msgChan <- planningTextMsg{text: TruncateString(strings.TrimSpace(text), 100)}
+			},
+
+			OnToolUse: func(toolUse *claude.ToolUse) (*claude.ToolResult, error) {
+				if toolUse.IsAskUserQuestion() {
+					input, err := toolUse.ParseAskUserQuestionInput()
+					if err != nil {
+						return nil, err
+					}
+					// Send question to TUI and wait for answer
+					// The answer will be sent via SendToolResult
+					m.msgChan <- planningQuestionMsg{
+						toolUseID: toolUse.ID,
+						questions: input.Questions,
+					}
+					// Return nil to indicate we're handling this asynchronously
+					return nil, nil
+				}
+				// Let Claude handle other tools
+				return nil, nil
+			},
+
+			OnError: func(err error) {
+				m.msgChan <- planningErrorMsg{err: err}
+			},
+		})
+
+		if err != nil {
+			m.msgChan <- planningErrorMsg{err: err}
+			return
 		}
-	}
+
+		// Wait for completion
+		if err := m.streamClient.Wait(); err != nil {
+			// Don't report error if we intentionally stopped
+			if ctx.Err() == nil {
+				m.msgChan <- planningErrorMsg{err: err}
+			}
+		}
+	}()
+
+	// Start polling the channel
+	return m.pollChannel()
 }
 
 // parseBreakdownFromText extracts and parses a breakdown JSON from text

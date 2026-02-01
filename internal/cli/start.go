@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/howell-aikit/aiflow/internal/state"
+	"github.com/howell-aikit/aiflow/internal/tui"
 	"github.com/howell-aikit/aiflow/internal/worktree"
 	"github.com/howell-aikit/aiflow/pkg/git"
 	"github.com/spf13/cobra"
@@ -17,16 +18,18 @@ var (
 )
 
 var startCmd = &cobra.Command{
-	Use:   "start <feature-description>",
+	Use:   "start [feature-description]",
 	Short: "Start a new feature implementation",
 	Long: `Start a new feature implementation with aiflow.
 
 This command will:
-1. Create an isolated git worktree for the feature
-2. Run an interactive breakdown session to decompose the feature into tasks
-3. Execute tasks with hybrid context management
-4. Allow you to review and merge changes when complete`,
-	Args: cobra.ExactArgs(1),
+1. Ask what you want to build (or use provided description)
+2. Detect if this is a new or existing project
+3. Run an adaptive Q&A session to gather requirements
+4. Break down the feature into implementable tasks
+5. Execute tasks with hybrid context management
+6. Allow you to review and merge changes when complete`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runStart,
 }
 
@@ -36,7 +39,11 @@ func init() {
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
-	featureDesc := args[0]
+	// Feature description is optional - TUI will ask if not provided
+	var featureDesc string
+	if len(args) > 0 {
+		featureDesc = args[0]
+	}
 
 	// Find repo root
 	repoPath, err := git.FindRepoRootFromCwd()
@@ -73,6 +80,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("branch %q does not exist", branch)
 	}
 
+	// Detect project type
+	projectType := DetectProjectType(repoPath)
+
 	// Initialize state store
 	store, err := state.NewStore(cfg.StateDir)
 	if err != nil {
@@ -84,40 +94,115 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if noWorktree {
 		// Use current directory
 		workingDir = repoPath
-		fmt.Printf("Using current directory: %s\n", workingDir)
 	} else {
-		// Create worktree
+		// Create worktree (use placeholder name if no feature desc yet)
 		wtManager, err := worktree.NewManager(repoPath, cfg.WorktreeDir)
 		if err != nil {
 			return fmt.Errorf("failed to initialize worktree manager: %w", err)
 		}
 
-		fmt.Printf("Creating worktree from %s...\n", branch)
-		workingDir, err = wtManager.Create(featureDesc, branch)
+		wtName := featureDesc
+		if wtName == "" {
+			wtName = "new-feature"
+		}
+
+		workingDir, err = wtManager.Create(wtName, branch)
 		if err != nil {
 			return fmt.Errorf("failed to create worktree: %w", err)
 		}
-		fmt.Printf("Created worktree: %s\n", workingDir)
 	}
 
-	// Create run
+	// Create run with optional feature description
 	run, err := store.CreateRun(featureDesc, workingDir, branch)
 	if err != nil {
 		return fmt.Errorf("failed to create run: %w", err)
 	}
 
-	fmt.Printf("\nStarted run: %s\n", run.ID)
-	fmt.Printf("Feature: %s\n", featureDesc)
-	fmt.Printf("Working directory: %s\n", workingDir)
-	fmt.Printf("\nNext steps:\n")
-	fmt.Printf("  1. The TUI will guide you through feature breakdown\n")
-	fmt.Printf("  2. Tasks will be executed with hybrid context\n")
-	fmt.Printf("  3. Review changes and merge when ready\n")
-	fmt.Printf("\nRun 'aiflow status %s' to check progress\n", run.ID)
+	// Set project type
+	run.ProjectType = string(projectType)
 
-	// TODO: Launch TUI for breakdown
-	// For now, just return success
-	return nil
+	// Initialize spec conversation
+	run.SpecConversation = &state.SpecConversation{
+		Turns:    []state.SpecTurn{},
+		MaxTurns: cfg.Spec.SafetyLimit,
+	}
+
+	// Save run with updated fields
+	if err := store.SaveRun(run); err != nil {
+		return fmt.Errorf("failed to save run: %w", err)
+	}
+
+	// Launch TUI for interactive breakdown
+	return tui.Run(cfg, run)
+}
+
+// DetectProjectType checks if the directory contains code files
+func DetectProjectType(workDir string) string {
+	// Code file extensions to look for
+	codeExtensions := []string{
+		".go", ".py", ".js", ".ts", ".jsx", ".tsx",
+		".java", ".rb", ".rs", ".c", ".cpp", ".h",
+		".cs", ".php", ".swift", ".kt", ".scala",
+	}
+
+	// Project files that indicate an existing project
+	projectFiles := []string{
+		"go.mod", "go.sum",
+		"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+		"Cargo.toml", "Cargo.lock",
+		"requirements.txt", "setup.py", "pyproject.toml", "Pipfile",
+		"Gemfile", "Gemfile.lock",
+		"pom.xml", "build.gradle", "build.gradle.kts",
+		"Makefile", "CMakeLists.txt",
+		"composer.json",
+	}
+
+	// Check for project files first
+	for _, pf := range projectFiles {
+		if _, err := os.Stat(filepath.Join(workDir, pf)); err == nil {
+			return "existing"
+		}
+	}
+
+	// Walk directory looking for code files (limit depth to avoid slow scans)
+	hasCodeFiles := false
+	maxDepth := 3
+	baseDepth := len(filepath.SplitList(workDir))
+
+	filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		// Skip hidden directories and common non-code dirs
+		if info.IsDir() {
+			name := info.Name()
+			if name[0] == '.' || name == "node_modules" || name == "vendor" || name == "__pycache__" {
+				return filepath.SkipDir
+			}
+			// Limit depth
+			depth := len(filepath.SplitList(path)) - baseDepth
+			if depth > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Check file extension
+		ext := filepath.Ext(path)
+		for _, codeExt := range codeExtensions {
+			if ext == codeExt {
+				hasCodeFiles = true
+				return filepath.SkipAll // Found one, stop searching
+			}
+		}
+		return nil
+	})
+
+	if hasCodeFiles {
+		return "existing"
+	}
+	return "empty"
 }
 
 // EnsureStateDir ensures the state directory exists

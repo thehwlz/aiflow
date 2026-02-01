@@ -31,19 +31,20 @@ type TaskSummary struct {
 
 // Task represents a single unit of work within a feature
 type Task struct {
-	ID          string       `json:"id"`
-	Title       string       `json:"title"`
-	Description string       `json:"description"`
-	FilesRead   []string     `json:"files_read"`
-	FilesWrite  []string     `json:"files_write"`
-	FilesCreate []string     `json:"files_create"`
-	DependsOn   []string     `json:"depends_on"`
-	Priority    int          `json:"priority"`
-	Status      TaskStatus   `json:"status"`
-	Summary     *TaskSummary `json:"summary,omitempty"`
-	Error       string       `json:"error,omitempty"`
-	StartedAt   *time.Time   `json:"started_at,omitempty"`
-	CompletedAt *time.Time   `json:"completed_at,omitempty"`
+	ID            string       `json:"id"`
+	Title         string       `json:"title"`
+	Description   string       `json:"description"`
+	FilesRead     []string     `json:"files_read"`
+	FilesWrite    []string     `json:"files_write"`
+	FilesCreate   []string     `json:"files_create"`
+	DependsOn     []string     `json:"depends_on"`
+	Priority      int          `json:"priority"`
+	ParallelGroup string       `json:"parallel_group,omitempty"` // Tasks in same group can run in parallel
+	Status        TaskStatus   `json:"status"`
+	Summary       *TaskSummary `json:"summary,omitempty"`
+	Error         string       `json:"error,omitempty"`
+	StartedAt     *time.Time   `json:"started_at,omitempty"`
+	CompletedAt   *time.Time   `json:"completed_at,omitempty"`
 }
 
 // IsReady returns true if the task can be executed
@@ -59,17 +60,46 @@ func (t *Task) IsReady(completedTasks map[string]bool) bool {
 	return true
 }
 
+// SpecQuestionOption represents an option for a spec question
+type SpecQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Recommended bool   `json:"recommended,omitempty"`
+}
+
+// SpecQuestion represents a question asked during spec conversation
+type SpecQuestion struct {
+	ID      string               `json:"id"`
+	Text    string               `json:"question"`
+	Options []SpecQuestionOption `json:"options,omitempty"`
+	Default string               `json:"default,omitempty"`
+}
+
+// SpecTurn represents one Q&A exchange in the spec conversation
+type SpecTurn struct {
+	Question SpecQuestion `json:"question"`
+	Answer   string       `json:"answer"`
+}
+
+// SpecConversation tracks the adaptive specification conversation
+type SpecConversation struct {
+	Turns    []SpecTurn `json:"turns"`
+	MaxTurns int        `json:"max_turns"`
+}
+
 // Run represents a complete feature implementation run
 type Run struct {
-	ID            string    `json:"id"`
-	FeatureDesc   string    `json:"feature_desc"`
-	WorktreePath  string    `json:"worktree_path"`
-	BaseBranch    string    `json:"base_branch"`
-	Tasks         []*Task   `json:"tasks"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	Status        RunStatus `json:"status"`
-	Error         string    `json:"error,omitempty"`
+	ID               string            `json:"id"`
+	FeatureDesc      string            `json:"feature_desc"`
+	WorktreePath     string            `json:"worktree_path"`
+	BaseBranch       string            `json:"base_branch"`
+	Tasks            []*Task           `json:"tasks"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
+	Status           RunStatus         `json:"status"`
+	Error            string            `json:"error,omitempty"`
+	ProjectType      string            `json:"project_type,omitempty"`      // "empty" or "existing"
+	SpecConversation *SpecConversation `json:"spec_conversation,omitempty"` // Adaptive spec Q&A
 }
 
 // RunStatus represents the overall status of a run

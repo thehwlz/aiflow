@@ -11,13 +11,14 @@ import (
 
 // TaskSpec represents a task specification from breakdown
 type TaskSpec struct {
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	FilesRead   []string `json:"files_read"`
-	FilesWrite  []string `json:"files_write"`
-	FilesCreate []string `json:"files_create"`
-	DependsOn   []string `json:"depends_on"` // References by title or index
-	Priority    int      `json:"priority"`
+	Title         string   `json:"title"`
+	Description   string   `json:"description"`
+	FilesRead     []string `json:"files_read"`
+	FilesWrite    []string `json:"files_write"`
+	FilesCreate   []string `json:"files_create"`
+	DependsOn     []string `json:"depends_on"`      // References by title or index
+	Priority      int      `json:"priority"`
+	ParallelGroup string   `json:"parallel_group"`  // Tasks in same group can run in parallel
 }
 
 // BreakdownResult contains the parsed breakdown from Claude
@@ -56,14 +57,15 @@ func ConvertToTasks(specs []TaskSpec) []*state.Task {
 	for i, spec := range specs {
 		id := uuid.New().String()[:8]
 		tasks[i] = &state.Task{
-			ID:          id,
-			Title:       spec.Title,
-			Description: spec.Description,
-			FilesRead:   spec.FilesRead,
-			FilesWrite:  spec.FilesWrite,
-			FilesCreate: spec.FilesCreate,
-			Priority:    spec.Priority,
-			Status:      state.TaskStatusPending,
+			ID:            id,
+			Title:         spec.Title,
+			Description:   spec.Description,
+			FilesRead:     spec.FilesRead,
+			FilesWrite:    spec.FilesWrite,
+			FilesCreate:   spec.FilesCreate,
+			Priority:      spec.Priority,
+			ParallelGroup: spec.ParallelGroup,
+			Status:        state.TaskStatusPending,
 		}
 		titleToID[spec.Title] = id
 		titleToID[fmt.Sprintf("%d", i)] = id // Also map by index

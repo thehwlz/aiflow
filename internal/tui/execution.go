@@ -17,8 +17,9 @@ import (
 
 // ExecutionModel handles the execution screen
 type ExecutionModel struct {
-	cfg  *config.Config
-	run  *state.Run
+	cfg   *config.Config
+	run   *state.Run
+	store *state.Store
 
 	// UI state
 	spinner   spinner.Model
@@ -33,8 +34,8 @@ type ExecutionModel struct {
 	outputs   map[string]string
 
 	// Current output display
-	currentTask   string
-	currentOutput []string
+	currentTask    string
+	currentOutput  []string
 	maxOutputLines int
 
 	// Done
@@ -43,7 +44,7 @@ type ExecutionModel struct {
 }
 
 // NewExecutionModel creates a new execution model
-func NewExecutionModel(cfg *config.Config, run *state.Run) ExecutionModel {
+func NewExecutionModel(cfg *config.Config, run *state.Run, store *state.Store) ExecutionModel {
 	p := progress.New(
 		progress.WithDefaultGradient(),
 		progress.WithWidth(40),
@@ -52,6 +53,7 @@ func NewExecutionModel(cfg *config.Config, run *state.Run) ExecutionModel {
 	return ExecutionModel{
 		cfg:            cfg,
 		run:            run,
+		store:          store,
 		spinner:        NewSpinner(),
 		progress:       p,
 		total:          len(run.Tasks),
@@ -126,6 +128,15 @@ func (m ExecutionModel) Update(msg tea.Msg) (ExecutionModel, tea.Cmd) {
 		m.done = true
 		m.err = msg.err
 		if msg.err != nil {
+			// Route to failure screen if we have task info, otherwise error screen
+			if msg.failedTask != nil {
+				return m, func() tea.Msg {
+					return FailureTransitionMsg{
+						FailedTask:  msg.failedTask,
+						LastGoodSHA: msg.lastGoodSHA,
+					}
+				}
+			}
 			return m, func() tea.Msg {
 				return ErrorMsg{Err: msg.err}
 			}
@@ -239,15 +250,47 @@ type taskCompletedMsg struct {
 }
 
 type executionCompleteMsg struct {
-	err error
+	err         error
+	failedTask  *state.Task
+	lastGoodSHA string
 }
 
 func (m ExecutionModel) startExecution() tea.Cmd {
 	return func() tea.Msg {
-		// In a real implementation, this would run the executor
-		// For now, simulate execution
-		time.Sleep(2 * time.Second)
-		return executionCompleteMsg{err: nil}
+		exec := executor.NewExecutor(m.cfg, m.run.WorktreePath, m.store, m.run)
+		ctx := context.Background()
+		err := exec.ExecuteAll(ctx, nil)
+
+		// If error, find the failed task and last good commit
+		var failedTask *state.Task
+		var lastGoodSHA string
+
+		if err != nil {
+			// Reload run to get latest state
+			if updatedRun, loadErr := m.store.LoadRun(m.run.ID); loadErr == nil {
+				// Find failed task
+				for _, t := range updatedRun.Tasks {
+					if t.Status == state.TaskStatusFailed {
+						failedTask = t
+						break
+					}
+				}
+				// Find last good commit from completed tasks
+				for i := len(updatedRun.Tasks) - 1; i >= 0; i-- {
+					t := updatedRun.Tasks[i]
+					if t.Status == state.TaskStatusCompleted && t.CommitSHA != "" {
+						lastGoodSHA = t.CommitSHA
+						break
+					}
+				}
+			}
+		}
+
+		return executionCompleteMsg{
+			err:         err,
+			failedTask:  failedTask,
+			lastGoodSHA: lastGoodSHA,
+		}
 	}
 }
 
@@ -265,14 +308,16 @@ func RunExecutor(cfg *config.Config, run *state.Run, store *state.Store) error {
 // ConfirmModel handles the task confirmation screen
 type ConfirmModel struct {
 	run          *state.Run
+	store        *state.Store
 	confirmed    bool
 	selectedItem int
 }
 
 // NewConfirmModel creates a new confirm model
-func NewConfirmModel(run *state.Run) ConfirmModel {
+func NewConfirmModel(run *state.Run, store *state.Store) ConfirmModel {
 	return ConfirmModel{
-		run: run,
+		run:   run,
+		store: store,
 	}
 }
 
@@ -283,6 +328,10 @@ func (m ConfirmModel) Update(msg tea.Msg) (ConfirmModel, tea.Cmd) {
 		switch msg.String() {
 		case "y", "enter":
 			m.confirmed = true
+			m.run.Status = state.RunStatusRunning
+			if m.store != nil {
+				m.store.SaveRun(m.run)
+			}
 			return m, func() tea.Msg {
 				return ScreenTransitionMsg{Screen: ScreenExecution}
 			}

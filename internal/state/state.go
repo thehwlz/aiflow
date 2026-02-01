@@ -43,6 +43,7 @@ type Task struct {
 	Status        TaskStatus   `json:"status"`
 	Summary       *TaskSummary `json:"summary,omitempty"`
 	Error         string       `json:"error,omitempty"`
+	CommitSHA     string       `json:"commit_sha,omitempty"` // Git commit SHA after task completion
 	StartedAt     *time.Time   `json:"started_at,omitempty"`
 	CompletedAt   *time.Time   `json:"completed_at,omitempty"`
 }

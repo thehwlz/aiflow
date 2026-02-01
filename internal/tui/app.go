@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"fmt"
-
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -57,14 +55,16 @@ const (
 	ScreenConfirm
 	ScreenExecution
 	ScreenComplete
+	ScreenFailure
 	ScreenError
 )
 
 // Model is the main TUI model
 type Model struct {
 	// Configuration
-	cfg *config.Config
-	run *state.Run
+	cfg   *config.Config
+	run   *state.Run
+	store *state.Store
 
 	// Current screen
 	screen Screen
@@ -73,6 +73,8 @@ type Model struct {
 	breakdown  BreakdownModel
 	confirm    ConfirmModel
 	execution  ExecutionModel
+	failure    FailureModel
+	completion CompletionModel
 
 	// State
 	err      error
@@ -84,15 +86,22 @@ type Model struct {
 }
 
 // NewModel creates a new TUI model
-func NewModel(cfg *config.Config, run *state.Run) Model {
+func NewModel(cfg *config.Config, run *state.Run, store *state.Store) Model {
 	return Model{
-		cfg:       cfg,
-		run:       run,
-		screen:    ScreenBreakdown,
-		breakdown: NewBreakdownModel(run),
-		confirm:   NewConfirmModel(run),
-		execution: NewExecutionModel(cfg, run),
+		cfg:        cfg,
+		run:        run,
+		store:      store,
+		screen:     ScreenBreakdown,
+		breakdown:  NewBreakdownModel(cfg, run, store),
+		confirm:    NewConfirmModel(run, store),
+		execution:  NewExecutionModel(cfg, run, store),
+		completion: NewCompletionModel(cfg, run, store),
 	}
+}
+
+// SetScreen sets the current screen
+func (m *Model) SetScreen(screen Screen) {
+	m.screen = screen
 }
 
 // Init initializes the model
@@ -127,8 +136,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = msg.Screen
 		switch m.screen {
 		case ScreenExecution:
+			// Reload run from store to get latest task status
+			if m.store != nil {
+				if updatedRun, err := m.store.LoadRun(m.run.ID); err == nil {
+					m.run = updatedRun
+				}
+			}
+			m.execution = NewExecutionModel(m.cfg, m.run, m.store)
 			return m, m.execution.Init()
+		case ScreenComplete:
+			m.completion = NewCompletionModel(m.cfg, m.run, m.store)
+			return m, nil
 		}
+		return m, nil
+
+	case FailureTransitionMsg:
+		m.screen = ScreenFailure
+		m.failure = NewFailureModel(m.cfg, m.run, m.store, msg.FailedTask, msg.LastGoodSHA)
 		return m, nil
 
 	case ErrorMsg:
@@ -146,6 +170,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirm, cmd = m.confirm.Update(msg)
 	case ScreenExecution:
 		m.execution, cmd = m.execution.Update(msg)
+	case ScreenFailure:
+		m.failure, cmd = m.failure.Update(msg)
+	case ScreenComplete:
+		m.completion, cmd = m.completion.Update(msg)
 	}
 
 	return m, cmd
@@ -166,22 +194,14 @@ func (m Model) View() string {
 	case ScreenExecution:
 		content = m.execution.View()
 	case ScreenComplete:
-		content = m.viewComplete()
+		content = m.completion.View()
+	case ScreenFailure:
+		content = m.failure.View()
 	case ScreenError:
 		content = m.viewError()
 	}
 
 	return content
-}
-
-func (m Model) viewComplete() string {
-	return boxStyle.Render(
-		titleStyle.Render("Complete!") + "\n\n" +
-			successStyle.Render("All tasks completed successfully.") + "\n\n" +
-			fmt.Sprintf("Worktree: %s\n", m.run.WorktreePath) +
-			"\nReview the changes and merge when ready.\n\n" +
-			dimStyle.Render("Press q to quit"),
-	)
 }
 
 func (m Model) viewError() string {
@@ -202,6 +222,12 @@ func (m Model) viewError() string {
 // ScreenTransitionMsg transitions to a new screen
 type ScreenTransitionMsg struct {
 	Screen Screen
+}
+
+// FailureTransitionMsg transitions to failure screen with context
+type FailureTransitionMsg struct {
+	FailedTask  *state.Task
+	LastGoodSHA string
 }
 
 // ErrorMsg indicates an error occurred
@@ -239,9 +265,9 @@ func TruncateString(s string, maxLen int) string {
 }
 
 // Run starts the TUI
-func Run(cfg *config.Config, run *state.Run) error {
+func Run(cfg *config.Config, run *state.Run, store *state.Store) error {
 	p := tea.NewProgram(
-		NewModel(cfg, run),
+		NewModel(cfg, run, store),
 		tea.WithAltScreen(),
 	)
 

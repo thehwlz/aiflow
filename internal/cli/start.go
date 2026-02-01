@@ -133,7 +133,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Launch TUI for interactive breakdown
-	return tui.Run(cfg, run)
+	return tui.Run(cfg, run, store)
 }
 
 // DetectProjectType checks if the directory contains code files

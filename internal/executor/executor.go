@@ -17,6 +17,7 @@ import (
 	ctxpkg "github.com/howell-aikit/aiflow/internal/context"
 	"github.com/howell-aikit/aiflow/internal/scheduler"
 	"github.com/howell-aikit/aiflow/internal/state"
+	"github.com/howell-aikit/aiflow/pkg/git"
 )
 
 // Executor handles Claude Code invocation for tasks
@@ -105,8 +106,50 @@ func (e *Executor) ExecuteTask(ctx context.Context, task *state.Task) *TaskResul
 		return result
 	}
 
+	// Create git commit for this task
+	if sha, err := e.commitTask(task); err != nil {
+		// Non-fatal: log warning but continue
+		fmt.Printf("Warning: failed to create commit for task %s: %v\n", task.ID, err)
+	} else if sha != "" {
+		task.CommitSHA = sha
+		e.store.UpdateTask(e.run.ID, task.ID, func(t *state.Task) {
+			t.CommitSHA = sha
+		})
+	}
+
 	result.Success = true
 	return result
+}
+
+// commitTask creates a git commit for the completed task
+func (e *Executor) commitTask(task *state.Task) (string, error) {
+	repo, err := git.Open(e.workDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Check if there are changes to commit
+	dirty, err := repo.IsDirty()
+	if err != nil {
+		return "", fmt.Errorf("failed to check status: %w", err)
+	}
+	if !dirty {
+		return "", nil // Nothing to commit
+	}
+
+	// Stage all changes
+	if err := repo.StageAll(); err != nil {
+		return "", fmt.Errorf("failed to stage changes: %w", err)
+	}
+
+	// Create commit
+	commitMsg := fmt.Sprintf("aiflow: %s", task.Title)
+	sha, err := repo.Commit(commitMsg)
+	if err != nil {
+		return "", fmt.Errorf("failed to commit: %w", err)
+	}
+
+	return sha, nil
 }
 
 // runClaudeCode invokes Claude Code with the given prompt

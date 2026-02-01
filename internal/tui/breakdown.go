@@ -1,13 +1,18 @@
 package tui
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/howell-aikit/aiflow/internal/breakdown"
+	"github.com/howell-aikit/aiflow/internal/claude"
+	"github.com/howell-aikit/aiflow/internal/config"
 	"github.com/howell-aikit/aiflow/internal/state"
 )
 
@@ -15,16 +20,18 @@ import (
 type BreakdownPhase int
 
 const (
-	PhaseInput        BreakdownPhase = iota // Ask what to build
-	PhaseDetecting                          // Show project type detection
-	PhaseConversation                       // Adaptive Q&A conversation
-	PhaseGenerating                         // Generating breakdown
-	PhaseReview                             // Review generated tasks
+	PhaseInput    BreakdownPhase = iota // Ask what to build
+	PhaseDetecting                       // Show project type detection
+	PhasePlanning                        // Claude exploring and asking questions
+	PhaseQuestion                        // Displaying a question from Claude
+	PhaseReview                          // Review generated tasks
 )
 
 // BreakdownModel handles the breakdown screen
 type BreakdownModel struct {
+	cfg     *config.Config
 	run     *state.Run
+	store   *state.Store
 	phase   BreakdownPhase
 	spinner spinner.Model
 
@@ -34,13 +41,11 @@ type BreakdownModel struct {
 	// Project detection
 	projectType string // "empty" or "existing"
 
-	// Conversation handling (PhaseConversation)
-	conversation    *breakdown.SpecConversation
-	currentQuestion *breakdown.ConversationQuestion
-	selectedOption  int             // Currently selected option index
-	isOtherSelected bool            // True when "Other" is selected
-	otherInput      textinput.Model // Input for custom answer
-	safetyLimit     int             // Max questions as safety valve
+	// Planning state (PhasePlanning/PhaseQuestion)
+	streamClient    *claude.StreamingClient
+	claudeOutput    []string       // Text output from Claude (for display)
+	currentQuestion *questionState // Current question being displayed
+	cancelPlanning  context.CancelFunc
 
 	// Task review (PhaseReview)
 	tasks        []*state.Task
@@ -50,16 +55,23 @@ type BreakdownModel struct {
 	err error
 }
 
+// questionState holds the state of a question being displayed
+type questionState struct {
+	toolUseID       string
+	questions       []claude.Question
+	currentIdx      int               // Current question index
+	answers         map[string]string // Collected answers
+	selectedOption  int               // Currently selected option
+	isOtherSelected bool
+	otherInput      textinput.Model
+}
+
 // NewBreakdownModel creates a new breakdown model
-func NewBreakdownModel(run *state.Run) BreakdownModel {
+func NewBreakdownModel(cfg *config.Config, run *state.Run, store *state.Store) BreakdownModel {
 	featureInput := textinput.New()
 	featureInput.Placeholder = "Describe what you want to build..."
 	featureInput.Focus()
 	featureInput.Width = 60
-
-	otherInput := textinput.New()
-	otherInput.Placeholder = "Type your answer..."
-	otherInput.Width = 60
 
 	// Determine starting phase
 	startPhase := PhaseInput
@@ -74,13 +86,14 @@ func NewBreakdownModel(run *state.Run) BreakdownModel {
 	}
 
 	return BreakdownModel{
+		cfg:          cfg,
 		run:          run,
+		store:        store,
 		phase:        startPhase,
 		spinner:      NewSpinner(),
 		featureInput: featureInput,
-		otherInput:   otherInput,
 		projectType:  projectType,
-		safetyLimit:  10,
+		claudeOutput: []string{},
 	}
 }
 
@@ -111,28 +124,42 @@ func (m BreakdownModel) Update(msg tea.Msg) (BreakdownModel, tea.Cmd) {
 
 	case projectTypeMsg:
 		m.projectType = msg.projectType
-		m.phase = PhaseConversation
-		m.conversation = breakdown.NewSpecConversation(
-			m.run.FeatureDesc,
-			breakdown.ProjectType(m.projectType),
-			m.safetyLimit,
-		)
-		return m, m.fetchNextQuestion()
+		m.phase = PhasePlanning
+		return m, m.startPlanning()
 
-	case specResponseMsg:
-		if msg.err != nil {
-			m.err = msg.err
-			return m, nil
+	case planningTextMsg:
+		m.claudeOutput = append(m.claudeOutput, msg.text)
+		// Keep only last 10 lines
+		if len(m.claudeOutput) > 10 {
+			m.claudeOutput = m.claudeOutput[len(m.claudeOutput)-10:]
 		}
-		return m.handleSpecResponse(msg.response)
+		return m, nil
 
-	case breakdownCompleteMsg:
+	case planningQuestionMsg:
+		m.phase = PhaseQuestion
+		otherInput := textinput.New()
+		otherInput.Placeholder = "Type your answer..."
+		otherInput.Width = 60
+		m.currentQuestion = &questionState{
+			toolUseID:  msg.toolUseID,
+			questions:  msg.questions,
+			currentIdx: 0,
+			answers:    make(map[string]string),
+			otherInput: otherInput,
+		}
+		return m, nil
+
+	case planningCompleteMsg:
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
 		m.tasks = msg.tasks
 		m.phase = PhaseReview
+		return m, nil
+
+	case planningErrorMsg:
+		m.err = msg.err
 		return m, nil
 	}
 
@@ -143,8 +170,17 @@ func (m BreakdownModel) handleKeyMsg(msg tea.KeyMsg) (BreakdownModel, tea.Cmd) {
 	switch m.phase {
 	case PhaseInput:
 		return m.handleFeatureInput(msg)
-	case PhaseConversation:
-		return m.handleConversationInput(msg)
+	case PhasePlanning:
+		// Allow cancellation
+		if msg.String() == "esc" {
+			if m.cancelPlanning != nil {
+				m.cancelPlanning()
+			}
+			return m, tea.Quit
+		}
+		return m, nil
+	case PhaseQuestion:
+		return m.handleQuestionInput(msg)
 	case PhaseReview:
 		return m.handleReviewInput(msg)
 	}
@@ -170,29 +206,31 @@ func (m BreakdownModel) handleFeatureInput(msg tea.KeyMsg) (BreakdownModel, tea.
 	}
 }
 
-func (m BreakdownModel) handleConversationInput(msg tea.KeyMsg) (BreakdownModel, tea.Cmd) {
+func (m BreakdownModel) handleQuestionInput(msg tea.KeyMsg) (BreakdownModel, tea.Cmd) {
 	if m.currentQuestion == nil {
 		return m, nil
 	}
 
-	totalOptions := len(m.currentQuestion.Options) + 1 // +1 for "Other"
+	q := m.currentQuestion
+	currentQ := q.questions[q.currentIdx]
+	totalOptions := len(currentQ.Options) + 1 // +1 for "Other"
 	otherIdx := totalOptions - 1
 
 	// If typing in "Other" input
-	if m.isOtherSelected {
+	if q.isOtherSelected {
 		switch msg.String() {
 		case "enter":
-			answer := strings.TrimSpace(m.otherInput.Value())
+			answer := strings.TrimSpace(q.otherInput.Value())
 			if answer == "" {
 				return m, nil
 			}
-			return m.submitAnswer(answer)
+			return m.submitQuestionAnswer(answer)
 		case "esc":
-			m.isOtherSelected = false
+			q.isOtherSelected = false
 			return m, nil
 		default:
 			var cmd tea.Cmd
-			m.otherInput, cmd = m.otherInput.Update(msg)
+			q.otherInput, cmd = q.otherInput.Update(msg)
 			return m, cmd
 		}
 	}
@@ -200,66 +238,71 @@ func (m BreakdownModel) handleConversationInput(msg tea.KeyMsg) (BreakdownModel,
 	// Option selection mode
 	switch msg.String() {
 	case "up", "k":
-		if m.selectedOption > 0 {
-			m.selectedOption--
+		if q.selectedOption > 0 {
+			q.selectedOption--
 		}
 	case "down", "j":
-		if m.selectedOption < totalOptions-1 {
-			m.selectedOption++
+		if q.selectedOption < totalOptions-1 {
+			q.selectedOption++
 		}
 	case "enter":
-		if m.selectedOption == otherIdx {
-			m.isOtherSelected = true
-			m.otherInput.Reset()
-			m.otherInput.Focus()
+		if q.selectedOption == otherIdx {
+			q.isOtherSelected = true
+			q.otherInput.Reset()
+			q.otherInput.Focus()
 			return m, textinput.Blink
 		}
-		return m.submitAnswer(m.currentQuestion.Options[m.selectedOption].Label)
-	case "s":
-		m.phase = PhaseGenerating
-		return m, m.forceBreakdown()
+		return m.submitQuestionAnswer(currentQ.Options[q.selectedOption].Label)
 	case "esc":
+		if m.cancelPlanning != nil {
+			m.cancelPlanning()
+		}
 		return m, tea.Quit
 	}
 
 	return m, nil
 }
 
-func (m BreakdownModel) submitAnswer(answer string) (BreakdownModel, tea.Cmd) {
-	m.conversation.AddTurn(*m.currentQuestion, answer)
+func (m BreakdownModel) submitQuestionAnswer(answer string) (BreakdownModel, tea.Cmd) {
+	q := m.currentQuestion
+	currentQ := q.questions[q.currentIdx]
 
-	if m.run.SpecConversation == nil {
-		m.run.SpecConversation = &state.SpecConversation{
-			Turns:    []state.SpecTurn{},
-			MaxTurns: m.safetyLimit,
+	// Store the answer using the header as key
+	key := currentQ.Header
+	if key == "" {
+		key = fmt.Sprintf("q%d", q.currentIdx)
+	}
+	q.answers[key] = answer
+
+	// Move to next question or submit all answers
+	q.currentIdx++
+	q.selectedOption = 0
+	q.isOtherSelected = false
+	q.otherInput.Reset()
+
+	if q.currentIdx >= len(q.questions) {
+		// All questions answered, send tool result back to Claude
+		m.phase = PhasePlanning
+		return m, m.sendQuestionAnswers()
+	}
+
+	return m, nil
+}
+
+func (m BreakdownModel) sendQuestionAnswers() tea.Cmd {
+	return func() tea.Msg {
+		if m.currentQuestion == nil || m.streamClient == nil {
+			return planningErrorMsg{err: fmt.Errorf("no pending question")}
 		}
+
+		result := claude.AnswerAskUserQuestion(m.currentQuestion.toolUseID, m.currentQuestion.answers)
+		if err := m.streamClient.SendToolResult(result); err != nil {
+			return planningErrorMsg{err: fmt.Errorf("failed to send answer: %w", err)}
+		}
+
+		m.currentQuestion = nil
+		return nil
 	}
-
-	// Convert options for storage
-	var stateOpts []state.SpecQuestionOption
-	for _, opt := range m.currentQuestion.Options {
-		stateOpts = append(stateOpts, state.SpecQuestionOption{
-			Label:       opt.Label,
-			Description: opt.Description,
-			Recommended: opt.Recommended,
-		})
-	}
-
-	m.run.SpecConversation.Turns = append(m.run.SpecConversation.Turns, state.SpecTurn{
-		Question: state.SpecQuestion{
-			ID:      m.currentQuestion.ID,
-			Text:    m.currentQuestion.Text,
-			Options: stateOpts,
-		},
-		Answer: answer,
-	})
-
-	m.currentQuestion = nil
-	m.selectedOption = 0
-	m.isOtherSelected = false
-	m.otherInput.Reset()
-
-	return m, m.fetchNextQuestion()
 }
 
 func (m BreakdownModel) handleReviewInput(msg tea.KeyMsg) (BreakdownModel, tea.Cmd) {
@@ -273,34 +316,17 @@ func (m BreakdownModel) handleReviewInput(msg tea.KeyMsg) (BreakdownModel, tea.C
 			m.selectedTask++
 		}
 	case "enter", "y":
+		// Save tasks to run before transitioning
+		m.run.Tasks = m.tasks
+		m.run.Status = state.RunStatusReady
+		if m.store != nil {
+			m.store.SaveRun(m.run)
+		}
 		return m, func() tea.Msg {
 			return ScreenTransitionMsg{Screen: ScreenConfirm}
 		}
 	case "esc", "q":
 		return m, tea.Quit
-	}
-
-	return m, nil
-}
-
-func (m BreakdownModel) handleSpecResponse(resp *breakdown.SpecResponse) (BreakdownModel, tea.Cmd) {
-	switch resp.ResponseType {
-	case "question":
-		if m.conversation != nil && !m.conversation.CanAskMore() {
-			m.phase = PhaseGenerating
-			return m, m.forceBreakdown()
-		}
-		m.currentQuestion = resp.Question
-		m.selectedOption = 0
-		m.isOtherSelected = false
-		return m, nil
-
-	case "ready":
-		m.phase = PhaseGenerating
-		tasks := breakdown.ConvertToTasks(resp.Breakdown.Tasks)
-		return m, func() tea.Msg {
-			return breakdownCompleteMsg{tasks: tasks, err: nil}
-		}
 	}
 
 	return m, nil
@@ -325,10 +351,10 @@ func (m BreakdownModel) View() string {
 		b.WriteString(m.viewInput())
 	case PhaseDetecting:
 		b.WriteString(m.viewDetecting())
-	case PhaseConversation:
-		b.WriteString(m.viewConversation())
-	case PhaseGenerating:
-		b.WriteString(m.viewGenerating())
+	case PhasePlanning:
+		b.WriteString(m.viewPlanning())
+	case PhaseQuestion:
+		b.WriteString(m.viewQuestion())
 	case PhaseReview:
 		b.WriteString(m.viewReview())
 	}
@@ -357,7 +383,7 @@ func (m BreakdownModel) viewDetecting() string {
 	return b.String()
 }
 
-func (m BreakdownModel) viewConversation() string {
+func (m BreakdownModel) viewPlanning() string {
 	var b strings.Builder
 
 	// Project context
@@ -368,39 +394,61 @@ func (m BreakdownModel) viewConversation() string {
 	b.WriteString(dimStyle.Render(projectLabel))
 	b.WriteString("\n\n")
 
-	// Conversation history
-	if m.conversation != nil && len(m.conversation.Turns) > 0 {
-		for _, turn := range m.conversation.Turns {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("  %s → %s",
-				TruncateString(turn.Question.Text, 40),
-				turn.Answer)))
+	b.WriteString(m.spinner.View())
+	b.WriteString(" Claude is exploring the codebase...")
+	b.WriteString("\n\n")
+
+	// Show recent output
+	if len(m.claudeOutput) > 0 {
+		b.WriteString(dimStyle.Render("Recent activity:"))
+		b.WriteString("\n")
+		for _, line := range m.claudeOutput {
+			truncated := TruncateString(line, 70)
+			b.WriteString(dimStyle.Render("  " + truncated))
 			b.WriteString("\n")
 		}
-		b.WriteString("\n")
 	}
 
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("Press Esc to cancel"))
+
+	return b.String()
+}
+
+func (m BreakdownModel) viewQuestion() string {
+	var b strings.Builder
+
 	if m.currentQuestion == nil {
-		b.WriteString(m.spinner.View())
-		b.WriteString(" Thinking...")
 		return b.String()
+	}
+
+	q := m.currentQuestion
+	if q.currentIdx >= len(q.questions) {
+		return b.String()
+	}
+
+	currentQ := q.questions[q.currentIdx]
+
+	// Progress indicator
+	if len(q.questions) > 1 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("Question %d of %d", q.currentIdx+1, len(q.questions))))
+		b.WriteString("\n\n")
 	}
 
 	// Question
 	b.WriteString(infoStyle.Render("? "))
-	b.WriteString(m.currentQuestion.Text)
+	b.WriteString(currentQ.Question)
 	b.WriteString("\n\n")
 
 	// Options or text input
-	if m.isOtherSelected {
-		b.WriteString("  " + m.otherInput.View())
+	if q.isOtherSelected {
+		b.WriteString("  " + q.otherInput.View())
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("  Enter to submit • Esc to go back"))
 	} else {
-		// Show options with recommendations and descriptions
-		for i, opt := range m.currentQuestion.Options {
-			isSelected := i == m.selectedOption
+		for i, opt := range currentQ.Options {
+			isSelected := i == q.selectedOption
 
-			// Build option display
 			var optLine strings.Builder
 			if isSelected {
 				optLine.WriteString(selectedStyle.Render("  > "))
@@ -408,12 +456,7 @@ func (m BreakdownModel) viewConversation() string {
 				optLine.WriteString("    ")
 			}
 
-			// Label with recommendation badge
 			label := opt.Label
-			if opt.Recommended {
-				label += " (Recommended)"
-			}
-
 			if isSelected {
 				optLine.WriteString(selectedStyle.Render(label))
 			} else {
@@ -423,16 +466,15 @@ func (m BreakdownModel) viewConversation() string {
 			b.WriteString(optLine.String())
 			b.WriteString("\n")
 
-			// Show description for selected option or all recommendations
-			if opt.Description != "" && (isSelected || opt.Recommended) {
+			if opt.Description != "" && isSelected {
 				b.WriteString(dimStyle.Render(fmt.Sprintf("      %s", opt.Description)))
 				b.WriteString("\n")
 			}
 		}
 
 		// "Other" option
-		otherIdx := len(m.currentQuestion.Options)
-		if m.selectedOption == otherIdx {
+		otherIdx := len(currentQ.Options)
+		if q.selectedOption == otherIdx {
 			b.WriteString(selectedStyle.Render("  > Other"))
 		} else {
 			b.WriteString(normalStyle.Render("    Other"))
@@ -440,17 +482,8 @@ func (m BreakdownModel) viewConversation() string {
 		b.WriteString("\n")
 
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  ↑/↓ select • Enter to confirm • s to skip"))
+		b.WriteString(dimStyle.Render("  ↑/↓ select • Enter to confirm"))
 	}
-
-	return b.String()
-}
-
-func (m BreakdownModel) viewGenerating() string {
-	var b strings.Builder
-
-	b.WriteString(m.spinner.View())
-	b.WriteString(" Generating task breakdown...")
 
 	return b.String()
 }
@@ -475,7 +508,7 @@ func (m BreakdownModel) viewReview() string {
 		for group, count := range parallelGroups {
 			groupInfo = append(groupInfo, fmt.Sprintf("%s (%d)", group, count))
 		}
-		b.WriteString(successStyle.Render(fmt.Sprintf("⚡ Parallel groups: %s", strings.Join(groupInfo, ", "))))
+		b.WriteString(successStyle.Render(fmt.Sprintf("Parallel groups: %s", strings.Join(groupInfo, ", "))))
 		b.WriteString("\n\n")
 	}
 
@@ -489,7 +522,6 @@ func (m BreakdownModel) viewReview() string {
 			style = selectedStyle
 		}
 
-		// Task title with parallel indicator
 		titleLine := fmt.Sprintf("%s%d. %s", prefix, i+1, task.Title)
 		if task.ParallelGroup != "" {
 			titleLine += fmt.Sprintf(" [%s]", task.ParallelGroup)
@@ -497,7 +529,6 @@ func (m BreakdownModel) viewReview() string {
 		b.WriteString(style.Render(titleLine))
 		b.WriteString("\n")
 
-		// Show details for selected task
 		if i == m.selectedTask {
 			if task.Description != "" {
 				wrapped := wrapText(task.Description, 50)
@@ -509,19 +540,6 @@ func (m BreakdownModel) viewReview() string {
 			if len(task.DependsOn) > 0 {
 				b.WriteString(dimStyle.Render(fmt.Sprintf("      Waits for: %v", task.DependsOn)))
 				b.WriteString("\n")
-			}
-			if task.ParallelGroup != "" {
-				// Find other tasks in same group
-				var siblings []string
-				for _, other := range m.tasks {
-					if other.ID != task.ID && other.ParallelGroup == task.ParallelGroup {
-						siblings = append(siblings, other.Title)
-					}
-				}
-				if len(siblings) > 0 {
-					b.WriteString(successStyle.Render(fmt.Sprintf("      ⚡ Runs parallel with: %s", strings.Join(siblings, ", "))))
-					b.WriteString("\n")
-				}
 			}
 		}
 	}
@@ -565,14 +583,22 @@ type projectTypeMsg struct {
 	projectType string
 }
 
-type specResponseMsg struct {
-	response *breakdown.SpecResponse
-	err      error
+type planningTextMsg struct {
+	text string
 }
 
-type breakdownCompleteMsg struct {
+type planningQuestionMsg struct {
+	toolUseID string
+	questions []claude.Question
+}
+
+type planningCompleteMsg struct {
 	tasks []*state.Task
 	err   error
+}
+
+type planningErrorMsg struct {
+	err error
 }
 
 func (m BreakdownModel) showProjectType() tea.Cmd {
@@ -581,139 +607,136 @@ func (m BreakdownModel) showProjectType() tea.Cmd {
 	}
 }
 
-func (m BreakdownModel) fetchNextQuestion() tea.Cmd {
+// planningState holds shared state for the planning goroutine
+type planningState struct {
+	mu          sync.Mutex
+	pendingMsgs []tea.Msg
+}
+
+func (m *BreakdownModel) startPlanning() tea.Cmd {
 	return func() tea.Msg {
-		turn := 0
-		if m.conversation != nil {
-			turn = len(m.conversation.Turns)
+		// Create context with cancellation
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelPlanning = cancel
+
+		// Get config values
+		claudePath := ""
+		if m.cfg != nil {
+			claudePath = m.cfg.ClaudeCodePath
+		}
+		workDir := m.run.WorktreePath
+		if workDir == "" {
+			workDir = "."
 		}
 
-		// Simulated adaptive responses
-		if m.projectType == "empty" {
-			switch turn {
-			case 0:
-				return specResponseMsg{
-					response: &breakdown.SpecResponse{
-						ResponseType: "question",
-						Question: &breakdown.ConversationQuestion{
-							ID:   "q1",
-							Text: "What language/framework would you like to use?",
-							Options: []breakdown.QuestionOption{
-								{
-									Label:       "Go",
-									Description: "Best for CLIs, APIs, and system tools",
-									Recommended: true,
-								},
-								{
-									Label:       "TypeScript/Node.js",
-									Description: "Best for web apps and full-stack projects",
-								},
-								{
-									Label:       "Python",
-									Description: "Best for scripts, data, and ML projects",
-								},
-								{
-									Label:       "Rust",
-									Description: "Best for performance-critical applications",
-								},
-							},
-						},
-					},
-				}
-			case 1:
-				return specResponseMsg{
-					response: &breakdown.SpecResponse{
-						ResponseType: "question",
-						Question: &breakdown.ConversationQuestion{
-							ID:   "q2",
-							Text: "What type of application is this?",
-							Options: []breakdown.QuestionOption{
-								{
-									Label:       "CLI tool",
-									Description: "Command-line interface application",
-								},
-								{
-									Label:       "REST API",
-									Description: "Backend HTTP API service",
-									Recommended: true,
-								},
-								{
-									Label:       "Web application",
-									Description: "Full-stack web app with frontend",
-								},
-								{
-									Label:       "Library/package",
-									Description: "Reusable code for other projects",
-								},
-							},
-						},
-					},
+		// Create streaming client
+		m.streamClient = claude.NewStreamingClient(claude.StreamingClientConfig{
+			ClaudePath: claudePath,
+			WorkDir:    workDir,
+		})
+
+		// Channel for receiving messages
+		msgChan := make(chan tea.Msg, 10)
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		// Start streaming in goroutine
+		go func() {
+			defer wg.Done()
+			defer close(msgChan)
+
+			prompt := claude.BuildPlanningPrompt(m.run.FeatureDesc, m.projectType)
+
+			err := m.streamClient.Start(ctx, prompt, claude.StreamOptions{
+				SystemPrompt:    claude.PlanningSystemPrompt,
+				SkipPermissions: true,
+
+				OnText: func(text string) {
+					// Check for breakdown JSON in the text
+					if strings.Contains(text, `"type": "breakdown"`) || strings.Contains(text, `"type":"breakdown"`) {
+						tasks, err := parseBreakdownFromText(text)
+						if err == nil && len(tasks) > 0 {
+							msgChan <- planningCompleteMsg{tasks: tasks}
+							m.streamClient.Stop()
+							return
+						}
+					}
+					msgChan <- planningTextMsg{text: TruncateString(strings.TrimSpace(text), 100)}
+				},
+
+				OnToolUse: func(toolUse *claude.ToolUse) (*claude.ToolResult, error) {
+					if toolUse.IsAskUserQuestion() {
+						input, err := toolUse.ParseAskUserQuestionInput()
+						if err != nil {
+							return nil, err
+						}
+						// Send question to TUI and wait for answer
+						// The answer will be sent via SendToolResult
+						msgChan <- planningQuestionMsg{
+							toolUseID: toolUse.ID,
+							questions: input.Questions,
+						}
+						// Return nil to indicate we're handling this asynchronously
+						return nil, nil
+					}
+					// Let Claude handle other tools
+					return nil, nil
+				},
+
+				OnError: func(err error) {
+					msgChan <- planningErrorMsg{err: err}
+				},
+			})
+
+			if err != nil {
+				msgChan <- planningErrorMsg{err: err}
+				return
+			}
+
+			// Wait for completion
+			if err := m.streamClient.Wait(); err != nil {
+				// Don't report error if we intentionally stopped
+				if ctx.Err() == nil {
+					msgChan <- planningErrorMsg{err: err}
 				}
 			}
+		}()
+
+		// Return the first message (or wait for one)
+		select {
+		case msg := <-msgChan:
+			return msg
+		case <-ctx.Done():
+			return planningErrorMsg{err: ctx.Err()}
 		}
-
-		return m.simulateBreakdown()
 	}
 }
 
-func (m BreakdownModel) simulateBreakdown() tea.Msg {
-	tasks := []*state.Task{
-		{
-			ID:            "task-1",
-			Title:         "Create project configuration",
-			Description:   "Set up go.mod, config files, and project structure",
-			Priority:      1,
-			ParallelGroup: "setup",
-			Status:        state.TaskStatusPending,
-		},
-		{
-			ID:            "task-2",
-			Title:         "Define core types and interfaces",
-			Description:   "Create the main data structures and interfaces",
-			Priority:      1,
-			ParallelGroup: "setup",
-			Status:        state.TaskStatusPending,
-		},
-		{
-			ID:            "task-3",
-			Title:         "Set up dependencies",
-			Description:   "Install and configure required packages",
-			Priority:      1,
-			ParallelGroup: "setup",
-			Status:        state.TaskStatusPending,
-		},
-		{
-			ID:            "task-4",
-			Title:         "Implement main logic",
-			Description:   "Build the core feature functionality",
-			Priority:      2,
-			DependsOn:     []string{"task-1", "task-2", "task-3"},
-			Status:        state.TaskStatusPending,
-		},
-		{
-			ID:            "task-5",
-			Title:         "Add unit tests",
-			Description:   "Write tests for core functionality",
-			Priority:      3,
-			ParallelGroup: "testing",
-			DependsOn:     []string{"task-4"},
-			Status:        state.TaskStatusPending,
-		},
-		{
-			ID:            "task-6",
-			Title:         "Add integration tests",
-			Description:   "Write end-to-end tests",
-			Priority:      3,
-			ParallelGroup: "testing",
-			DependsOn:     []string{"task-4"},
-			Status:        state.TaskStatusPending,
-		},
+// parseBreakdownFromText extracts and parses a breakdown JSON from text
+func parseBreakdownFromText(text string) ([]*state.Task, error) {
+	// Find JSON object in text
+	start := strings.Index(text, "{")
+	end := strings.LastIndex(text, "}")
+	if start == -1 || end == -1 || end <= start {
+		return nil, fmt.Errorf("no JSON found")
 	}
-	return breakdownCompleteMsg{tasks: tasks, err: nil}
-}
 
-func (m BreakdownModel) forceBreakdown() tea.Cmd {
-	return func() tea.Msg {
-		return m.simulateBreakdown()
+	jsonStr := text[start : end+1]
+
+	// Parse the breakdown
+	var result struct {
+		Type    string `json:"type"`
+		Summary string `json:"summary"`
+		Tasks   []breakdown.TaskSpec `json:"tasks"`
 	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		return nil, err
+	}
+
+	if result.Type != "breakdown" {
+		return nil, fmt.Errorf("not a breakdown response")
+	}
+
+	return breakdown.ConvertToTasks(result.Tasks), nil
 }

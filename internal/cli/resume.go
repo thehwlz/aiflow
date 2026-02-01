@@ -3,7 +3,9 @@ package cli
 import (
 	"fmt"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/howell-aikit/aiflow/internal/state"
+	"github.com/howell-aikit/aiflow/internal/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -103,8 +105,12 @@ func runResume(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\nRun 'aiflow status %s' to see full details\n", run.ID)
+	fmt.Printf("\nLaunching execution...\n")
 
-	// TODO: Launch TUI or executor for continuation
-	return nil
+	// Launch TUI at execution screen
+	model := tui.NewModel(cfg, run, store)
+	model.SetScreen(tui.ScreenExecution)
+	p := tea.NewProgram(&model, tea.WithAltScreen())
+	_, err = p.Run()
+	return err
 }

@@ -68,6 +68,66 @@ func (r *Repository) GetDefaultBranch() string {
 	return branch
 }
 
+// StageAll stages all changes in the working directory
+func (r *Repository) StageAll() error {
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// Add all changes
+	_, err = wt.Add(".")
+	if err != nil {
+		return fmt.Errorf("failed to stage changes: %w", err)
+	}
+
+	return nil
+}
+
+// Commit creates a commit with the given message and returns the commit SHA
+func (r *Repository) Commit(message string) (string, error) {
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// Check if there are staged changes
+	status, err := wt.Status()
+	if err != nil {
+		return "", fmt.Errorf("failed to get status: %w", err)
+	}
+
+	if status.IsClean() {
+		return "", fmt.Errorf("nothing to commit")
+	}
+
+	hash, err := wt.Commit(message, &git.CommitOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to commit: %w", err)
+	}
+
+	return hash.String(), nil
+}
+
+// ResetHard resets the repository to a specific commit SHA
+func (r *Repository) ResetHard(sha string) error {
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	hash := plumbing.NewHash(sha)
+	err = wt.Reset(&git.ResetOptions{
+		Mode:   git.HardReset,
+		Commit: hash,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reset to %s: %w", sha, err)
+	}
+
+	return nil
+}
+
 // IsDirty returns true if there are uncommitted changes
 func (r *Repository) IsDirty() (bool, error) {
 	wt, err := r.repo.Worktree()

@@ -74,6 +74,13 @@ aiflow clean --all      # Remove all runs
 aiflow clean -f abc123  # Force (no confirmation)
 ```
 
+### Update aiflow
+
+```bash
+aiflow update           # Pull latest and rebuild
+aiflow update -i        # Pull, rebuild, and install to /usr/local/bin
+```
+
 ## Configuration
 
 Create `~/.aiflow/config.toml`:
@@ -87,6 +94,7 @@ context_max_files = 20
 context_max_tokens = 8000
 state_dir = "~/.aiflow/state"
 lock_timeout = "5m"
+source_dir = ""  # aiflow source dir for self-update (auto-detected if empty)
 
 [summaries]
 include_for_dependencies = true

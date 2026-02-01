@@ -38,6 +38,7 @@ func init() {
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(resumeCmd)
+	rootCmd.AddCommand(updateCmd)
 }
 
 // Execute runs the root command

@@ -10,15 +10,17 @@ import (
 
 // Config holds all aiflow configuration
 type Config struct {
-	WorktreeDir      string         `toml:"worktree_dir"`
-	MaxParallel      int            `toml:"max_parallel"`
-	ClaudeCodePath   string         `toml:"claude_code_path"`
-	DefaultBranch    string         `toml:"default_branch"`
-	ContextMaxFiles  int            `toml:"context_max_files"`
-	ContextMaxTokens int            `toml:"context_max_tokens"`
-	StateDir         string         `toml:"state_dir"`
-	LockTimeout      string         `toml:"lock_timeout"`
-	Summaries        SummaryConfig  `toml:"summaries"`
+	WorktreeDir      string        `toml:"worktree_dir"`
+	MaxParallel      int           `toml:"max_parallel"`
+	ClaudeCodePath   string        `toml:"claude_code_path"`
+	DefaultBranch    string        `toml:"default_branch"`
+	ContextMaxFiles  int           `toml:"context_max_files"`
+	ContextMaxTokens int           `toml:"context_max_tokens"`
+	StateDir         string        `toml:"state_dir"`
+	LockTimeout      string        `toml:"lock_timeout"`
+	SourceDir        string        `toml:"source_dir"` // aiflow source directory for self-update
+	Summaries        SummaryConfig `toml:"summaries"`
+	Spec             SpecConfig    `toml:"spec"`
 }
 
 // SummaryConfig holds settings for task summary inclusion
@@ -26,6 +28,11 @@ type SummaryConfig struct {
 	IncludeForDependencies bool `toml:"include_for_dependencies"`
 	IncludeForSameFeature  bool `toml:"include_for_same_feature"`
 	MaxSummaryTokens       int  `toml:"max_summary_tokens"`
+}
+
+// SpecConfig holds settings for the adaptive specification flow
+type SpecConfig struct {
+	SafetyLimit int `toml:"safety_limit"` // Max questions before forcing breakdown (safety valve)
 }
 
 // Default returns the default configuration
@@ -44,6 +51,9 @@ func Default() *Config {
 			IncludeForDependencies: true,
 			IncludeForSameFeature:  true,
 			MaxSummaryTokens:       1000,
+		},
+		Spec: SpecConfig{
+			SafetyLimit: 10,
 		},
 	}
 }
